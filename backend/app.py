@@ -258,19 +258,30 @@ def index():
 def serve_assets(path):
     """
     Tries to serve a specific static file (CSS, JS, etc.). If the file is 
-    not found (i.e., it's a client-side route like /dashboard), 
-    it falls back to serving index.html for React Router.
+    not found, it tries a fallback location ('public/') before serving 
+    index.html for client-side routing.
     """
     # Print the path Flask is looking for to help with debugging
     print(f"Attempting to serve static asset: {path} from directory: {app.static_folder}")
     
-    try:
-        # This attempts to serve the file from the static folder ('frontend')
-        # We explicitly set `app.static_folder` to the absolute path of 'frontend/'
-        # This should correctly serve files like 'src/main.jsx' and 'Plogo2.png'
-        return send_from_directory(app.static_folder, path)
-    except Exception as e:
-        # Log the exception if serving the asset failed
-        print(f"Asset serving failed for path: {path}. Error: {e}")
-        # If the asset isn't found, it's likely a client-side route, so serve the SPA entry point
-        return send_from_directory(app.static_folder, 'index.html')
+    mimetype_override = None
+    # 1. MIME Type Fix (for module scripts)
+    if path.endswith('.jsx') or path.endswith('.js'):
+        mimetype_override = 'application/javascript'
+        print(f"Applying MIME type override: {mimetype_override} for {path}")
+    
+    # 2. Check 1: Direct path (e.g., /src/main.jsx)
+    full_path = os.path.join(app.static_folder, path)
+    if os.path.exists(full_path) and not os.path.isdir(full_path):
+        return send_from_directory(app.static_folder, path, mimetype=mimetype_override)
+    
+    # 3. Check 2: Fallback path in 'public' directory (e.g., /Plogo2.png -> /public/Plogo2.png)
+    public_path = os.path.join('public', path)
+    full_public_path = os.path.join(app.static_folder, public_path)
+    if os.path.exists(full_public_path) and not os.path.isdir(full_public_path):
+        print(f"Asset not found directly. Serving from fallback path: {public_path}")
+        return send_from_directory(app.static_folder, public_path, mimetype=mimetype_override)
+        
+    # 4. Check 3: Not an asset, serve index.html for client-side routing (404/Not Found fallback)
+    print(f"Asset {path} not found. Assuming client-side route. Serving index.html.")
+    return send_from_directory(app.static_folder, 'index.html')
