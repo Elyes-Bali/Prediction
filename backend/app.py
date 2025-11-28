@@ -12,9 +12,14 @@ import io
 import time 
 import pickle # Added for loading the trained StandardScaler
 
-# --- FLASK SETUP ---
-# CRITICAL: Point Flask to serve the 'dist' folder inside 'frontend'
-app = Flask(__name__, static_folder='frontend/dist', static_url_path='/', template_folder='frontend/dist') 
+# --- FLASK SETUP (FIXED PATHS) ---
+# Calculate the absolute path to the frontend folder
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# FIX: Point directly to 'frontend' as requested, assuming index.html sits there
+FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend') 
+
+# CRITICAL FIX: Use absolute path to serve the 'frontend' folder
+app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='/', template_folder=FRONTEND_DIR) 
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Define and create the UPLOAD_FOLDER
@@ -257,7 +262,7 @@ def serve_assets(path):
     it falls back to serving index.html for React Router.
     """
     try:
-        # This attempts to serve the file from 'frontend/dist'
+        # This attempts to serve the file from the static folder ('frontend')
         return send_from_directory(app.static_folder, path)
     except:
         # If the file is not found (e.g., '/about' route), serve the SPA entry point
