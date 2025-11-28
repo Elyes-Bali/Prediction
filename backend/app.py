@@ -261,9 +261,16 @@ def serve_assets(path):
     not found (i.e., it's a client-side route like /dashboard), 
     it falls back to serving index.html for React Router.
     """
+    # Print the path Flask is looking for to help with debugging
+    print(f"Attempting to serve static asset: {path} from directory: {app.static_folder}")
+    
     try:
         # This attempts to serve the file from the static folder ('frontend')
+        # We explicitly set `app.static_folder` to the absolute path of 'frontend/'
+        # This should correctly serve files like 'src/main.jsx' and 'Plogo2.png'
         return send_from_directory(app.static_folder, path)
-    except:
-        # If the file is not found (e.g., '/about' route), serve the SPA entry point
+    except Exception as e:
+        # Log the exception if serving the asset failed
+        print(f"Asset serving failed for path: {path}. Error: {e}")
+        # If the asset isn't found, it's likely a client-side route, so serve the SPA entry point
         return send_from_directory(app.static_folder, 'index.html')
