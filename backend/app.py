@@ -10,6 +10,7 @@ import os
 import sys
 import io
 import time 
+import pickle # Added for loading the trained StandardScaler
 
 # --- FLASK SETUP ---
 # CRITICAL: Point Flask to serve the 'dist' folder inside 'frontend'
@@ -25,6 +26,8 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_PATH
 
 # --- MODEL PATH (Relative to the project root, where gunicorn runs) ---
 MODEL_PATH = "backend/model/modele_detection_panne.keras"
+# PATH FOR THE TRAINED SCALER (Assumed to be exported from training notebook)
+SCALER_PATH = "backend/model/scaler.pkl" 
 
 
 # --- MODEL PARAMETERS ---
@@ -73,10 +76,20 @@ def run_inference(csv_path):
         
         print(f"Data shape: {df_raw.shape}. Features extracted: {df_features.shape[1]}")
 
-        # --- TEMPORARY NORMALIZATION STEP ---
-        print("Applying temporary StandardScaler (Warning: for accurate results, use TRAINING statistics).")
-        temp_scaler = StandardScaler()
-        data_scaled = temp_scaler.fit_transform(data_to_process)
+        # --- PROPER NORMALIZATION STEP (Loads the training-fitted scaler) ---
+        print(f"Attempting to load StandardScaler from: {SCALER_PATH}")
+        try:
+            with open(SCALER_PATH, 'rb') as f:
+                scaler = pickle.load(f)
+            
+            print("Applying training-fitted StandardScaler.")
+            data_scaled = scaler.transform(data_to_process)
+        except FileNotFoundError:
+            # Fallback for when the scaler file is missing
+            print("WARNING: Scaler file not found at expected path. Falling back to temporary StandardScaler fitted on inference data.")
+            print("This will lead to incorrect predictions unless the inference data perfectly matches the training data statistics.")
+            scaler = StandardScaler()
+            data_scaled = scaler.fit_transform(data_to_process)
 
         # Load the trained Keras model
         print(f"Loading Keras model from: {MODEL_PATH}")
@@ -227,22 +240,25 @@ def run_model():
     return jsonify(results)
 
 
-# --- ROUTE TO SERVE REACT FRONTEND (SIMPLIFIED FIX) ---
-# This is the most crucial part for fixing the 404s.
-@app.route('/', defaults={'path': 'index.html'})
+# --- ROUTE TO SERVE REACT FRONTEND (CORRECTED PATTERN) ---
+
+# 1. Dedicated route for the root (/) to explicitly serve index.html
+@app.route('/')
+def index():
+    """Serves the main index.html file for the root path."""
+    return send_from_directory(app.static_folder, 'index.html')
+
+# 2. Catch-all for all other paths (assets or client-side routes)
 @app.route('/<path:path>')
-def serve(path):
+def serve_assets(path):
     """
-    Serves the React frontend's index.html for the root, and lets Flask 
-    handle static files (CSS/JS) automatically via the static_folder config.
-    For all other paths (handled by React Router), it serves index.html.
+    Tries to serve a specific static file (CSS, JS, etc.). If the file is 
+    not found (i.e., it's a client-side route like /dashboard), 
+    it falls back to serving index.html for React Router.
     """
-    # Try to serve the requested file first (CSS, JS, images, etc.)
-    # Flask's send_from_directory will automatically map requested URLs 
-    # (like /assets/main.js) to the static_folder ('frontend/dist').
     try:
+        # This attempts to serve the file from 'frontend/dist'
         return send_from_directory(app.static_folder, path)
     except:
-        # If the file is not found, it must be a client-side route (e.g., /dashboard).
-        # In this case, serve the main index.html file so React Router can take over.
+        # If the file is not found (e.g., '/about' route), serve the SPA entry point
         return send_from_directory(app.static_folder, 'index.html')
