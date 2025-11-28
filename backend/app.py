@@ -13,7 +13,7 @@ import time # <--- ADDED: Import time module for performance measurement
 
 # --- FLASK SETUP (MODIFIED) ---
 # 1. Initialize Flask to serve the 'dist' folder (React build)
-app = Flask(__name__, static_folder='dist', static_url_path='/', template_folder='dist') 
+app = Flask(__name__, static_folder='frontend/dist', static_url_path='/', template_folder='frontend/dist') 
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 UPLOAD_FOLDER = 'uploads'
