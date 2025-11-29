@@ -4,6 +4,7 @@ import io
 import time
 import pickle
 import mimetypes
+import traceback
 
 import pandas as pd
 import numpy as np
@@ -15,46 +16,43 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 # ------------------------------------------------------------
-# MIME TYPES (defensive; build output usually fine)
+# Configuration via environment
+# ------------------------------------------------------------
+DEFAULT_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", "128"))
+WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "1000"))
+BEST_THRESHOLD = float(os.environ.get("BEST_THRESHOLD", "0.69"))
+
+# ------------------------------------------------------------
+# MIME TYPES (defensive)
 # ------------------------------------------------------------
 mimetypes.add_type('application/javascript', '.js')
 mimetypes.add_type('application/javascript', '.mjs')
 
 # ------------------------------------------------------------
-# PATHS
+# Paths
 # ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend')
-DIST_DIR = os.path.join(FRONTEND_DIR, 'dist')  # Vite build output
+DIST_DIR = os.path.join(FRONTEND_DIR, 'dist')  # must exist after build
 
 print(f"[Startup] BASE_DIR={BASE_DIR}")
 print(f"[Startup] FRONTEND_DIR={FRONTEND_DIR}")
 print(f"[Startup] DIST_DIR={DIST_DIR}")
 
-# Flask will serve built assets from dist
+# Flask app
 app = Flask(__name__, static_folder=DIST_DIR, static_url_path='/', template_folder=DIST_DIR)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ------------------------------------------------------------
-# UPLOAD FOLDER
-# ------------------------------------------------------------
+# Upload folder
 UPLOAD_FOLDER_NAME = 'uploads'
-UPLOAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', UPLOAD_FOLDER_NAME)
+UPLOAD_PATH = os.path.join(BASE_DIR, '..', UPLOAD_FOLDER_NAME)
 os.makedirs(UPLOAD_PATH, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_PATH
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB safeguard
 
-# ------------------------------------------------------------
-# MODEL / SCALER PATHS
-# ------------------------------------------------------------
+# Model paths (relative to project root)
 MODEL_PATH = "backend/model/modele_detection_panne.keras"
 SCALER_PATH = "backend/model/scaler.pkl"
-
-# ------------------------------------------------------------
-# INFERENCE SETTINGS
-# ------------------------------------------------------------
-BATCH_SIZE = 4096
-WINDOW_SIZE = 1000
-BEST_THRESHOLD = 0.69
 
 FEATURE_COLUMNS = [
     'FIC2003_valeur', 'LI2001_valeur', 'MX2001_valeur',
@@ -64,74 +62,117 @@ FEATURE_COLUMNS = [
 ]
 
 # ------------------------------------------------------------
-# GENERATOR
+# Globals (lazy-loaded)
+# ------------------------------------------------------------
+_global_model = None
+_global_scaler = None
+
+def load_scaler():
+    global _global_scaler
+    if _global_scaler is not None:
+        return _global_scaler
+    try:
+        with open(SCALER_PATH, 'rb') as f:
+            _global_scaler = pickle.load(f)
+        print("[Scaler] Loaded training scaler.")
+    except FileNotFoundError:
+        print("[Scaler] WARNING: scaler.pkl missing; will fit temporary scaler per inference.")
+        _global_scaler = None
+    return _global_scaler
+
+def load_model():
+    global _global_model
+    if _global_model is not None:
+        return _global_model
+    t0 = time.time()
+    print(f"[Model] Loading model from {MODEL_PATH} ...")
+    _global_model = keras.models.load_model(MODEL_PATH)
+    print(f"[Model] Loaded in {time.time()-t0:.2f}s")
+    return _global_model
+
+# ------------------------------------------------------------
+# Generator (memory-efficient)
 # ------------------------------------------------------------
 def sequence_generator(data, time_steps, batch_size):
     n_sequences = len(data) - time_steps + 1
-    for i in range(0, n_sequences, batch_size):
-        batch_end_index = min(i + batch_size, n_sequences)
-        X_batch = [data[idx:idx + time_steps] for idx in range(i, batch_end_index)]
-        yield (np.array(X_batch),)
+    for start in range(0, n_sequences, batch_size):
+        end = min(start + batch_size, n_sequences)
+        # Build batch
+        batch_len = end - start
+        X = np.empty((batch_len, time_steps, data.shape[1]), dtype=np.float32)
+        for i, seq_idx in enumerate(range(start, end)):
+            X[i] = data[seq_idx:seq_idx + time_steps]
+        yield (X,)
 
 # ------------------------------------------------------------
-# INFERENCE CORE
+# Inference Core
 # ------------------------------------------------------------
-def run_inference(csv_path):
+def run_inference(csv_path, batch_size):
     old_stdout = sys.stdout
     sys.stdout = log_stream = io.StringIO()
     try:
-        print(f"Loading CSV: {csv_path}")
+        print(f"[Inference] CSV path: {csv_path}")
         df_raw = pd.read_csv(csv_path)
 
         if 'Unnamed: 0' in df_raw.columns:
-            df_raw = df_raw.drop('Unnamed: 0', axis=1)
+            df_raw = df_raw.drop(columns=['Unnamed: 0'])
+
+        # Validate necessary columns
+        missing_cols = [c for c in FEATURE_COLUMNS + ['datetime'] if c not in df_raw.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
 
         df_raw['datetime'] = pd.to_datetime(df_raw['datetime'])
-        df_features = df_raw[FEATURE_COLUMNS].copy()
-        data_to_process = df_features.values
+        df_features = df_raw[FEATURE_COLUMNS].astype('float32')  # ensure float32
+        data_np = df_features.to_numpy(dtype=np.float32)
 
-        print(f"Data shape: {df_raw.shape}")
-        print(f"Attempting scaler load: {SCALER_PATH}")
-        try:
-            with open(SCALER_PATH, 'rb') as f:
-                scaler = pickle.load(f)
-            data_scaled = scaler.transform(data_to_process)
-            print("Scaler loaded and applied.")
-        except FileNotFoundError:
-            print("WARNING: scaler.pkl not found. Fitting new scaler (may reduce accuracy).")
-            scaler = StandardScaler()
-            data_scaled = scaler.fit_transform(data_to_process)
+        print(f"[Inference] Rows={len(df_raw)}, Features={df_features.shape[1]}")
+        scaler = load_scaler()
+        if scaler is not None:
+            data_scaled = scaler.transform(data_np)
+        else:
+            print("[Inference] Fitting temporary StandardScaler (WARNING)")
+            temp_scaler = StandardScaler()
+            data_scaled = temp_scaler.fit_transform(data_np)
 
-        print(f"Loading model: {MODEL_PATH}")
-        t0 = time.time()
-        model = keras.models.load_model(MODEL_PATH)
-        print(f"Model load time: {time.time() - t0:.2f}s")
+        data_scaled = data_scaled.astype(np.float32)
+
+        if len(data_scaled) < WINDOW_SIZE:
+            raise ValueError(f"Insufficient rows ({len(data_scaled)}) for window size {WINDOW_SIZE}")
+
+        model = load_model()
 
         n_sequences = len(data_scaled) - WINDOW_SIZE + 1
-        if n_sequences <= 0:
-            raise ValueError(f"Not enough rows ({len(data_scaled)}) for WINDOW_SIZE={WINDOW_SIZE}")
+        # Auto-limit batch size for extremely large sequences
+        effective_batch = min(batch_size, max(1, n_sequences // 4) if n_sequences > batch_size * 10 else batch_size)
+        print(f"[Inference] Sequences: {n_sequences}, Requested batch: {batch_size}, Effective batch: {effective_batch}")
 
-        steps = int(np.ceil(n_sequences / BATCH_SIZE))
-        print(f"Predicting {n_sequences} sequences in {steps} steps...")
-        t1 = time.time()
-        y_proba = model.predict(sequence_generator(data_scaled, WINDOW_SIZE, BATCH_SIZE),
-                                steps=steps, verbose=1).flatten()
-        print(f"Inference time: {time.time() - t1:.2f}s")
+        steps = int(np.ceil(n_sequences / effective_batch))
+        print(f"[Inference] Predicting in {steps} steps...")
+
+        t_pred = time.time()
+        y_proba = model.predict(
+            sequence_generator(data_scaled, WINDOW_SIZE, effective_batch),
+            steps=steps,
+            verbose=1
+        ).flatten()
+        print(f"[Inference] Prediction time: {time.time()-t_pred:.2f}s")
 
         y_pred_binary = (y_proba >= BEST_THRESHOLD).astype(int)
-        prediction_labels = np.where(y_pred_binary == 1, 'Fault (Panne)', 'Normal')
+        labels = np.where(y_pred_binary == 1, 'Fault (Panne)', 'Normal')
 
-        start_idx = WINDOW_SIZE - 1
-        datetime_end = df_raw['datetime'].iloc[start_idx:].reset_index(drop=True)
+        start_index = WINDOW_SIZE - 1
+        datetime_end = df_raw['datetime'].iloc[start_index:].reset_index(drop=True)
+
         results_df = pd.DataFrame({
             'TimeWindow_Ends_At': datetime_end.iloc[:len(y_proba)],
             'Fault_Probability': y_proba,
-            'Prediction': prediction_labels
+            'Prediction': labels
         })
 
-        print("Analyzing fault events...")
-        step_duration = df_raw['datetime'].iloc[1] - df_raw['datetime'].iloc[0]
-        offset = (WINDOW_SIZE - 1) * step_duration
+        print("[Inference] Aggregating fault events...")
+        time_step_duration = df_raw['datetime'].iloc[1] - df_raw['datetime'].iloc[0]
+        offset = (WINDOW_SIZE - 1) * time_step_duration
         results_df['TimeWindow_Start_At'] = results_df['TimeWindow_Ends_At'] - offset
         results_df = results_df[['TimeWindow_Start_At', 'TimeWindow_Ends_At', 'Fault_Probability', 'Prediction']]
 
@@ -139,10 +180,10 @@ def run_inference(csv_path):
         group_change = is_fault.diff().fillna(is_fault.iloc[0])
         group_id = (group_change == True).cumsum()
 
-        fault_events = results_df[is_fault].copy()
-        if not fault_events.empty:
-            fault_events['group'] = group_id[is_fault]
-            fault_summary = fault_events.groupby('group').agg(
+        fault_subset = results_df[is_fault].copy()
+        if not fault_subset.empty:
+            fault_subset['group'] = group_id[is_fault]
+            fault_summary = fault_subset.groupby('group').agg(
                 Fault_Start_Time=('TimeWindow_Start_At', 'min'),
                 Fault_End_Time=('TimeWindow_Ends_At', 'max'),
                 Max_Probability=('Fault_Probability', 'max'),
@@ -154,25 +195,26 @@ def run_inference(csv_path):
                 'Fault_Start_Time', 'Fault_End_Time', 'Max_Probability', 'Duration_Windows', 'Duration'
             ])
 
-        print("Inference complete.")
+        print("[Inference] Complete.")
         return {
+            'status': 'success',
             'logs': log_stream.getvalue(),
             'summary_data': fault_summary.to_json(orient='split', date_format='iso'),
-            'detailed_data': results_df.head(100).to_json(orient='split', date_format='iso'),
-            'status': 'success'
+            'detailed_data': results_df.head(100).to_json(orient='split', date_format='iso')
         }
     except Exception as e:
-        print(f"ERROR: {e}")
+        print("[Inference] ERROR:", e)
+        traceback.print_exc()
         return {
-            'logs': log_stream.getvalue(),
             'status': 'error',
-            'error_message': str(e)
+            'error_message': str(e),
+            'logs': log_stream.getvalue()
         }
     finally:
         sys.stdout = old_stdout
 
 # ------------------------------------------------------------
-# API ENDPOINTS
+# API: Preview
 # ------------------------------------------------------------
 @app.route('/api/upload-preview', methods=['POST'])
 def upload_preview():
@@ -193,43 +235,60 @@ def upload_preview():
     except Exception as e:
         return jsonify({'error': f"Failed to read CSV: {e}"}), 500
 
+# ------------------------------------------------------------
+# API: Run Model
+# ------------------------------------------------------------
 @app.route('/api/run-model', methods=['POST'])
 def run_model():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     f = request.files['file']
+    if f.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
     filename = secure_filename(f.filename)
     path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     try:
         f.save(path)
-        results = run_inference(path)
+        result = run_inference(path, DEFAULT_BATCH_SIZE)
+        code = 200 if result.get('status') == 'success' else 500
+        return jsonify(result), code
     except Exception as e:
-        results = {'logs': f"Error: {e}", 'status': 'error', 'error_message': str(e)}
+        return jsonify({
+            'status': 'error',
+            'error_message': str(e)
+        }), 500
     finally:
         if os.path.exists(path):
             os.remove(path)
-    return jsonify(results)
 
 # ------------------------------------------------------------
-# FRONTEND (SPA) ROUTES
+# Frontend (SPA) Routes
 # ------------------------------------------------------------
 @app.route('/')
 def index():
+    if not os.path.exists(os.path.join(app.static_folder, 'index.html')):
+        return "Front-end build missing. Run npm build.", 500
     return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/<path:subpath>')
 def spa_or_asset(subpath):
-    full_path = os.path.join(app.static_folder, subpath)
-    if os.path.exists(full_path) and not os.path.isdir(full_path):
+    full = os.path.join(app.static_folder, subpath)
+    if os.path.exists(full) and not os.path.isdir(full):
         return send_from_directory(app.static_folder, subpath)
-    # Fallback to SPA entrypoint
     return send_from_directory(app.static_folder, 'index.html')
 
 # ------------------------------------------------------------
-# LOCAL ENTRY
+# Healthcheck
+# ------------------------------------------------------------
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok', 'model_loaded': _global_model is not None})
+
+# ------------------------------------------------------------
+# Local run
 # ------------------------------------------------------------
 if __name__ == '__main__':
-    # For local debugging (after build)
     if not os.path.isdir(DIST_DIR):
-        print("WARNING: dist directory not found. Run: cd frontend && npm install && npm run build")
-    app.run(host='0.0.0.0', port=8000, debug=True)
+        print("WARNING: dist directory not found. Run build before starting.")
+    app.run(host='0.0.0.0', port=5000, debug=True)
