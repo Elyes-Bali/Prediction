@@ -11,10 +11,9 @@ import sys
 import io
 import time 
 import pickle # Added for loading the trained StandardScaler
-import mimetypes
+
 # --- FLASK SETUP (FIXED PATHS) ---
 # Calculate the absolute path to the frontend folder
-mimetypes.add_type('application/javascript', '.jsx')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # FIX: Point directly to 'frontend' as requested, assuming index.html sits there
 FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend') 
@@ -262,31 +261,24 @@ def serve_assets(path):
     not found, it tries a fallback location ('public/') before serving 
     index.html for client-side routing.
     """
-    # Print the path Flask is looking for to help with debugging
-    print(f"Attempting to serve static asset: {path} from directory: {app.static_folder}")
-    
+    # Determine the correct MIME type for JavaScript modules
     mimetype_override = None
-    # 1. MIME Type Fix (for module scripts)
-    # Check if the path is specifically for a JavaScript module file
     if path.endswith('.jsx') or path.endswith('.js'):
-        mimetype_override = 'application/javascript'
-        print(f"Applying MIME type override: {mimetype_override} for {path}")
+        # Using 'text/javascript' which is often more widely accepted for module scripts
+        mimetype_override = 'text/javascript'
     
-    # 2. Check 1: Direct path (e.g., /src/main.jsx or /some.css)
+    # 1. Check 1: Direct path (e.g., /src/main.jsx or /some.css)
     full_path = os.path.join(app.static_folder, path)
     if os.path.exists(full_path) and not os.path.isdir(full_path):
-        print(f"Asset found directly: {path}")
         return send_from_directory(app.static_folder, path, mimetype=mimetype_override)
 
-    # 3. Check 2: Fallback path in 'public' directory (e.g., /Plogo2.png -> /public/Plogo2.png)
+    # 2. Check 2: Fallback path in 'public' directory (e.g., /Plogo2.png -> /public/Plogo2.png)
     public_relative_path = os.path.join('public', path)
     full_public_path = os.path.join(app.static_folder, public_relative_path)
     
     if os.path.exists(full_public_path) and not os.path.isdir(full_public_path):
-        print(f"Asset not found directly. Serving from fallback path: {public_relative_path}")
-        # Pass the relative path 'public/Plogo2.png' to send_from_directory
+        # Serve from the public subdirectory
         return send_from_directory(app.static_folder, public_relative_path, mimetype=mimetype_override)
         
-    # 4. Fallback: Not an asset, serve index.html for client-side routing (404/Not Found fallback)
-    print(f"Asset {path} not found in direct or public paths. Assuming client-side route. Serving index.html.")
+    # 3. Fallback: Not an asset, serve index.html for client-side routing (404/Not Found fallback)
     return send_from_directory(app.static_folder, 'index.html')
