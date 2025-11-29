@@ -11,9 +11,10 @@ import sys
 import io
 import time 
 import pickle # Added for loading the trained StandardScaler
-
+import mimetypes
 # --- FLASK SETUP (FIXED PATHS) ---
 # Calculate the absolute path to the frontend folder
+mimetypes.add_type('application/javascript', '.jsx')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # FIX: Point directly to 'frontend' as requested, assuming index.html sits there
 FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend') 
